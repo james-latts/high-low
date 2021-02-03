@@ -11,29 +11,12 @@ from itertools import product
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 
-# Globals
-FEATURES = ["Sma", "Max", "Min", "Std", "Ema", "Rsi"]
-N = [7, 14, 21] * 15
-FEATURE_COLUMNS = list(map("_".join, product([str(n) for n in N], FEATURES)))
-
 
 #### MAIN ####
 
 
 
 #### FUNCTIONS ####
-def compute_rsi(data, time_window):
-    diff = data.diff(1)
-    up_chg = 0 * diff
-    down_chg = 0 * diff    
-    up_chg[diff > 0] = diff[ diff>0 ]
-    down_chg[diff < 0] = diff[ diff < 0 ]    
-    up_chg_avg = up_chg.ewm(com=time_window-1 , min_periods=time_window).mean()
-    down_chg_avg = down_chg.ewm(com=time_window-1 , min_periods=time_window).mean()    
-    rs = abs(up_chg_avg/down_chg_avg)
-    rsi = 100 - 100/(1+rs)
-    return rsi
-
 def train(epoch, train_dataloader):
     model.train()
     total_loss = 0.
@@ -124,61 +107,35 @@ class TimeSeriesModel(nn.Module):
     
 #### RUN MAIN ####
 ## STEP 1: Obtain and clean data
-# Load in the xjo data
-xjo_data_location = "/home/james/Documents/finance/high-low/data/xjo/1-minute/2020"
-original_data_df = pd.DataFrame()
-for xjo_csv_file in os.listdir(xjo_data_location):
-    xjo_csv_location = xjo_data_location + "/" + xjo_csv_file
-    csv_data_df = pd.read_csv(xjo_csv_location)
-    original_data_df = pd.concat([original_data_df, csv_data_df])
-del xjo_data_location, xjo_csv_file, xjo_csv_location, csv_data_df
+# Load in the data in csv
+xjo_data_location = "/home/james/Documents/finance/high-low/gold/data/november_3_minute.csv"
+original_data_df = pd.read_csv(xjo_data_location)
 
 # Create cleaned dataframe
 data_df = pd.DataFrame()
-data_df["DateTime"] = pd.to_datetime(original_data_df["Time"])
-data_df["Price"] = original_data_df["Last"]
-data_df["Log_Price"] = np.log(data_df["Price"])
-data_df["Time"] = data_df["DateTime"].dt.time
-data_df = data_df.sort_values("DateTime", ascending = True).set_index("DateTime")
+data_df["date_time"] = pd.to_datetime(original_data_df["Date"])
+data_df["price"] = original_data_df["Close"]
+data_df["log_price"] = np.log(data_df["price"])
+data_df["open"] = original_data_df["Open"]
+data_df["high"] = original_data_df["High"]
+data_df["low"] = original_data_df["Low"]
+data_df["close"] = original_data_df["Close"]
+data_df["rsi.0"] = original_data_df["RSI.0"]
+data_df["rvi.0"] = original_data_df["RVI.0"]
+data_df["smi.0"] = original_data_df["SMI.0"]
+data_df["smi.1"] = original_data_df["SMI.1"]
+data_df["srsi.1"] = original_data_df["sRSI.0"]
+data_df["srsi.1"] = original_data_df["sRSI.1"]
+data_df["time"] = data_df["date_time"].dt.time
+data_df = data_df.sort_values("date_time", ascending = True).set_index("date_time")
 
 # Clean dataframe
-data_df = data_df[data_df.index.date != dt.date(2020, 11, 16)]
-data_df = data_df[data_df["Time"] <= dt.time(16, 0, 0)]
+data_df = data_df[data_df.index.date != dt.date(2020, 11, 16)] # remove first 110
+data_df = data_df[data_df["time"] <= dt.time(8, 0, 0) and data_df["time"] <= dt.time(10, 0, 0)] # remove non trading
 
 
-## STEP 2: Add additional features to the data
-# Add additional features
-data_df["Delta"] = data_df["Log_Price"].diff(-15) * 100
-data_df["Positive"] = (data_df["Delta"] > 0).astype(np.int)
-data_df["Big_Positive"] = (data_df["Delta"] - np.mean(data_df["Delta"]) > 0.5 * np.std(data_df["Delta"])).astype(np.int)
-data_df["y"] = data_df["Big_Positive"]
-
-# Simple moving average
-for n in N:
-    data_df[str(n) + "_Sma"] = (data_df["Price"].rolling(window=n).mean() / data_df["Price"] - 1) * 100
-
-# Rolling standard deviation
-for n in N:
-    data_df[str(n) + "_Std"] = data_df["Price"].rolling(window=n).std()
-
-# Rolling min
-for n in N:
-    data_df[str(n) + "_Min"] = data_df["Price"].rolling(window=n).min()
-    
-# Rolling max
-for n in N:
-    data_df[str(n) + "_Max"] = data_df["Price"].rolling(window=n).max()
-
-# Exponential moving average
-for n in N:
-    data_df[str(n) + "_Ema"] = (data_df["Price"].ewm(span=n).mean() / data_df["Price"] - 1) * 100
-
-# Relative strength index
-for n in N:
-    data_df[str(n) + '_Rsi'] = compute_rsi(data_df["Price"], n)
-    
-# Drop any NAs
-data_df = data_df.dropna()
+## STEP 2: Add additional features to the data and target variable
+# Need to add in target
 
 
 ## STEP 3: Get train and validation datasets

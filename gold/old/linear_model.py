@@ -1,19 +1,20 @@
 #### IMPORTS & GLOBALS ####
 # Imports
 import os
-import time
 import torch
 import numpy as np
 import pandas as pd
 import datetime as dt
 import torch.nn as nn
+from sklearn import metrics
+from itertools import product
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 
 # Globals
-#FEATURE_COLUMNS = ["Change", "Hour", "Minute"]
-FEATURE_COLUMNS = ["Hour", "Minute", "Price", "Last_Price", "Change", \
-                   "10_sma", "25_sma", "50_sma", "100_sma", "200_sma", \
-                   "10_ema", "25_ema", "50_ema", "100_ema", "200_ema"]
+FEATURES = ["Sma", "Max", "Min", "Std", "Ema", "Rsi"]
+N = [7, 14, 21] * 15
+FEATURE_COLUMNS = list(map("_".join, product([str(n) for n in N], FEATURES)))
 
 
 #### MAIN ####
@@ -21,18 +22,17 @@ FEATURE_COLUMNS = ["Hour", "Minute", "Price", "Last_Price", "Change", \
 
 
 #### FUNCTIONS ####
-def get_x(row, df, window_size, feature_list):
-    x = []
-    for f in feature_list:
-        values = df[f][row-window_size:row].values
-        x.append(values)
-    x = np.stack(x, axis = 1)
-    return x
-
-def get_y(row, df, window_size, feature_list):
-    y = np.sum(df["Change"][row:row+window_size].values)
-    y = 1 if y > 0 else 0
-    return y
+def compute_rsi(data, time_window):
+    diff = data.diff(1)
+    up_chg = 0 * diff
+    down_chg = 0 * diff    
+    up_chg[diff > 0] = diff[ diff>0 ]
+    down_chg[diff < 0] = diff[ diff < 0 ]    
+    up_chg_avg = up_chg.ewm(com=time_window-1 , min_periods=time_window).mean()
+    down_chg_avg = down_chg.ewm(com=time_window-1 , min_periods=time_window).mean()    
+    rs = abs(up_chg_avg/down_chg_avg)
+    rsi = 100 - 100/(1+rs)
+    return rsi
 
 def train(epoch, train_dataloader):
     model.train()
@@ -77,141 +77,154 @@ def evaluate(eval_model, dataloader):
 #### CLASSES ####
 class TimeSeriesDataset(Dataset):
     """ Time Series Dataset """
-    def __init__(self, data, transform=None):
+    def __init__(self, X, Y, transform=None):
         """
         Args:
             data (string): The time series data as a pandas dataframe.
             transform (callable, optional): Optional transform to be applied
                 on a sample.
         """
-        self.data = data
+        self.X = X
+        self.Y = Y
         self.transform = transform
 
     def __len__(self):
-        return len(self.data)
+        return len(self.Y)
 
     def __getitem__(self, idx):
-        x = self.data.iloc[idx]["x"]
-        y = self.data.iloc[idx]["y"]
+        x = self.X[idx]
+        y = self.Y[idx]
         if self.transform:
             x = self.transform(x)
-        return x[0], y
+        return x, y
 
 class TimeSeriesModel(nn.Module):
-    def __init__(self, classes, nlen, ninp, nhid, nlayers, dropout, bi):
+    def __init__(self, classes, ninp, nhid, dropout):
         super(TimeSeriesModel, self).__init__()
         self.model_type = 'TimeSeries'
-        self.bi = bi
-        self.nlen = nlen
         self.ninp = ninp
         self.nhid = nhid
-        self.nlayers = nlayers
         self.dropout = nn.Dropout(dropout)
-        #self.lstm = nn.LSTM(ninp, nhid, nlayers, dropout = dropout, batch_first = True, bidirectional = bi)
-        self.linear = nn.Linear(ninp * nlen, 10)
-        self.classify = nn.Linear(10, classes)
+        self.linear_1 = nn.Linear(ninp, nhid)
+        self.linear_2 = nn.Linear(nhid, nhid // 2)
+        self.linear_3 = nn.Linear(nhid // 2, nhid // 4)
+        self.classify = nn.Linear(nhid // 4, classes)
 
     def forward(self, features):
-        #features = self.dropout(features)
-        #features = self.lstm(features)
-        #features = features[0].reshape((-1, (1 + bi) * self.nhid * self.nlen))
         features = self.dropout(features)
-        features = self.linear(features)
+        features = self.linear_1(features)
+        features = self.dropout(features)
+        features = self.linear_2(features)
+        features = self.dropout(features)
+        features = self.linear_3(features)
         features = self.dropout(features)
         output = self.classify(features)
         return output
-
-
+    
+    
 #### RUN MAIN ####
-#
-xjo_data_location = "/home/james/Documents/finance/data-acquisition/bar_chart/minute_data"
+## STEP 1: Obtain and clean data
+# Load in the xjo data
+xjo_data_location = "/home/james/Documents/finance/high-low/data/xjo/1-minute/2020"
 original_data_df = pd.DataFrame()
 for xjo_csv_file in os.listdir(xjo_data_location):
     xjo_csv_location = xjo_data_location + "/" + xjo_csv_file
     csv_data_df = pd.read_csv(xjo_csv_location)
     original_data_df = pd.concat([original_data_df, csv_data_df])
+del xjo_data_location, xjo_csv_file, xjo_csv_location, csv_data_df
 
-#
+# Create cleaned dataframe
 data_df = pd.DataFrame()
 data_df["DateTime"] = pd.to_datetime(original_data_df["Time"])
-#data_df['Date'] = data_df['DateTime'].dt.date
-data_df['Time'] = data_df['DateTime'].dt.time
-data_df['Hour'] = data_df['DateTime'].dt.hour
-data_df['Minute'] = data_df['DateTime'].dt.minute
-data_df["Price"] = original_data_df["Open"]
-data_df = data_df.sort_values("DateTime")
+data_df["Price"] = original_data_df["Last"]
+data_df["Log_Price"] = np.log(data_df["Price"])
+data_df["Time"] = data_df["DateTime"].dt.time
+data_df = data_df.sort_values("DateTime", ascending = True).set_index("DateTime")
 
-
-#
+# Clean dataframe
+data_df = data_df[data_df.index.date != dt.date(2020, 11, 16)]
 data_df = data_df[data_df["Time"] <= dt.time(16, 0, 0)]
-data_df = data_df[data_df["Time"] >= dt.time(11, 0, 0)]
-last_price_df = data_df[["Price"]].shift(1)
-last_price_df.columns = ["Last_Price"]
-data_df = pd.concat([data_df, last_price_df], axis = 1).dropna()
-data_df["Change"] = ((data_df["Price"] - data_df["Last_Price"]) / data_df["Last_Price"]) * 100
-data_df["10_sma"] = data_df["Price"].rolling(window=10).mean()
-data_df["25_sma"] = data_df["Price"].rolling(window=25).mean()
-data_df["50_sma"] = data_df["Price"].rolling(window=50).mean()
-data_df["100_sma"] = data_df["Price"].rolling(window=100).mean()
-data_df["200_sma"] = data_df["Price"].rolling(window=200).mean()
-data_df["10_ema"] = data_df["Price"].ewm(span=10).mean()
-data_df["25_ema"] = data_df["Price"].ewm(span=25).mean()
-data_df["50_ema"] = data_df["Price"].ewm(span=50).mean()
-data_df["100_ema"] = data_df["Price"].ewm(span=100).mean()
-data_df["200_ema"] = data_df["Price"].ewm(span=200).mean()
-data_df = data_df[["DateTime"] + FEATURE_COLUMNS].dropna()
 
-x_window_size = 1
-y_window_size = 15
-batch_size = 500
 
-test_data = data_df.query('20201101 <= DateTime').reset_index()
-test_data_new = test_data.iloc[x_window_size:len(test_data) - y_window_size, :]
-test_data_new["xIndex"] = test_data_new.index
-test_data_new["x"] = test_data_new["xIndex"].apply(lambda x: get_x(x, test_data, x_window_size, FEATURE_COLUMNS))
-test_data_new["y"] = test_data_new["xIndex"].apply(lambda x: get_y(x, test_data, y_window_size, FEATURE_COLUMNS))
-test_dataset = TimeSeriesDataset(test_data_new[["x", "y"]])
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=0)
+## STEP 2: Add additional features to the data
+# Add additional features
+data_df["Delta"] = data_df["Log_Price"].diff(-15) * 100
+data_df["Positive"] = (data_df["Delta"] > 0).astype(np.int)
+data_df["Big_Positive"] = (data_df["Delta"] - np.mean(data_df["Delta"]) > 0.5 * np.std(data_df["Delta"])).astype(np.int)
+data_df["y"] = data_df["Big_Positive"]
+
+# Simple moving average
+for n in N:
+    data_df[str(n) + "_Sma"] = (data_df["Price"].rolling(window=n).mean() / data_df["Price"] - 1) * 100
+
+# Rolling standard deviation
+for n in N:
+    data_df[str(n) + "_Std"] = data_df["Price"].rolling(window=n).std()
+
+# Rolling min
+for n in N:
+    data_df[str(n) + "_Min"] = data_df["Price"].rolling(window=n).min()
     
-val_data = data_df.query('20200901 <= DateTime < 20201101').reset_index()
-val_data_new = val_data.iloc[x_window_size:len(val_data) - y_window_size, :]
-val_data_new["xIndex"] = val_data_new.index
-val_data_new["x"] = val_data_new["xIndex"].apply(lambda x: get_x(x, val_data, x_window_size, FEATURE_COLUMNS))
-val_data_new["y"] = val_data_new["xIndex"].apply(lambda x: get_y(x, val_data, y_window_size, FEATURE_COLUMNS))
-val_dataset = TimeSeriesDataset(val_data_new[["x", "y"]])
+# Rolling max
+for n in N:
+    data_df[str(n) + "_Max"] = data_df["Price"].rolling(window=n).max()
+
+# Exponential moving average
+for n in N:
+    data_df[str(n) + "_Ema"] = (data_df["Price"].ewm(span=n).mean() / data_df["Price"] - 1) * 100
+
+# Relative strength index
+for n in N:
+    data_df[str(n) + '_Rsi'] = compute_rsi(data_df["Price"], n)
+    
+# Drop any NAs
+data_df = data_df.dropna()
+
+
+## STEP 3: Get train and validation datasets
+# Train dataset
+batch_size = 1000
+train_start_date = "2020-05-01"
+train_end_date =  "2020-09-30"
+train_data = data_df.loc[train_start_date:train_end_date]
+X = train_data[FEATURE_COLUMNS].values
+y = train_data["y"].values
+train_dataset = TimeSeriesDataset(X, y)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)  
+
+# Validation dataset
+val_start_date = "2020-10-01"
+val_end_date =  "2020-10-31"
+val_data = data_df.loc[val_start_date:val_end_date]
+X_v = val_data[FEATURE_COLUMNS].values
+y_v = val_data["y"].values
+val_dataset = TimeSeriesDataset(X_v, y_v)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
 
-train_data = data_df.query('20200901 > DateTime').reset_index()
-train_data_new = train_data.iloc[x_window_size:len(train_data) - y_window_size, :]
-train_data_new["xIndex"] = train_data_new.index
-train_data_new["x"] = train_data_new["xIndex"].apply(lambda x: get_x(x, train_data, x_window_size, FEATURE_COLUMNS))
-train_data_new["y"] = train_data_new["xIndex"].apply(lambda x: get_y(x, train_data, y_window_size, FEATURE_COLUMNS))
-train_dataset = TimeSeriesDataset(train_data_new[["x", "y"]])
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
+## STEP 4: Create the model and train
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 classes = 1
 ninp = len(FEATURE_COLUMNS)
-nlen = x_window_size
-nhid = 100
-nlayers = 5
-dropout = 0.5
-bi = True
-model = TimeSeriesModel(classes, nlen, ninp, nhid, nlayers, dropout, bi).to(device).double()
+nhid = 128
+dropout = 0
+model = TimeSeriesModel(classes, ninp, nhid, dropout).to(device).double()
 
-weight = (len(train_data_new) - sum(train_data_new["y"])) / sum(train_data_new["y"])
+# Set weight to balance classes
+weight = (len(train_data) - sum(train_data["y"])) / sum(train_data["y"])
 
+# Set loss and optimizer
 criterion = nn.BCEWithLogitsLoss(pos_weight = torch.tensor(weight), reduction='sum')
 optimizer = torch.optim.Adam(model.parameters())
 
+# Initialise val, model and epochs
 best_val_loss = float("inf")
 best_val_acc = float(0)
 epochs = 100 # The number of epochs
 best_model = None
 
+# Train model
 for epoch in range(1, epochs + 1):
-    epoch_start_time = time.time()
     train(epoch, train_dataloader)
     val_loss, val_acc, val_pred = evaluate(model, val_dataloader)
     print('-' * 89)
@@ -227,47 +240,38 @@ for epoch in range(1, epochs + 1):
         best_model = model
 
     optimizer.step()
-    
-test_loss, test_acc, test_pred = evaluate(best_model, test_dataloader)
+
+## STEP 5: Calibrate the model
+# Calibration dataset
+cal_start_date = "2020-11-01"
+cal_end_date =  "2020-11-30"
+cal_data = data_df.loc[cal_start_date:cal_end_date]
+X_t = cal_data[FEATURE_COLUMNS].values
+y_t = cal_data["y"].values
+cal_data = TimeSeriesDataset(X_t, y_t)
+cal_dataloader = DataLoader(cal_data, batch_size=batch_size, num_workers=0)
+
+cal_loss, cal_acc, y_c_prob = evaluate(best_model, cal_dataloader)
 print('=' * 89)
-print('| End of training | test loss {:5.4f} | test acc {:5.2f}'.format(
-    test_loss /len(test_dataset) * 100, test_acc / len(test_dataset) * 100))
+print('| End of training | cal loss {:5.4f} | cal acc {:5.2f}'.format(
+    cal_loss /len(cal_dataset) * 100, cal_acc / len(cal_dataset) * 100))
 print('| Best val epoch {:3d} | val loss {:5.4f} | val acc {:5.2f}'.format(
     best_epoch, best_val_loss /len(val_dataset) * 100, best_val_acc / len(val_dataset) * 100))
 print('=' * 89)
 
-from sklearn import metrics
-import matplotlib.pyplot as plt
-
-fpr, tpr, thresholds = metrics.roc_curve(val_data_new["y"], best_val_pred, pos_label=1)
+y_t = test_data["Positive"].values
+y_t_prob = np.array(y_t_prob).reshape((-1))
+fpr, tpr, thresholds = metrics.roc_curve(y_t, y_t_prob, pos_label=1)
 auc = metrics.auc(fpr, tpr)
-
-plt.figure()
-lw = 2
-plt.plot(fpr, tpr, color='darkorange',
-         lw=lw, label='ROC curve (area = %0.2f)' % auc)
-plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver operating characteristic val')
-plt.legend(loc="lower right")
-plt.show()
-
 gmeans = np.sqrt(tpr * (1-fpr))
-optimal_threshold = thresholds[np.argmax(gmeans)]
-pred = np.where(np.array(best_val_pred) >= optimal_threshold, 1, 0)
-acc = np.sum(pred == val_data_new["y"].values.reshape((-1,1))) / len(val_data_new["y"])
-print('best val acc {:5.2f}'.format(acc * 100))
-
-fpr, tpr, thresholds = metrics.roc_curve(test_data_new["y"], test_pred, pos_label=1)
-auc = metrics.auc(fpr, tpr)
+idx = np.argmax(gmeans) - 1
+optimal_threshold = thresholds[idx]
 
 plt.figure()
 lw = 2
 plt.plot(fpr, tpr, color='darkorange',
-         lw=lw, label='ROC curve (area = %0.2f)' % auc)
+         lw=lw, label='ROC curve (area = %0.4f)' % auc)
+plt.scatter(fpr[idx], tpr[idx], marker='o', color='black', label='Best')
 plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
 plt.xlim([0.0, 1.0])
 plt.ylim([0.0, 1.05])
@@ -277,8 +281,111 @@ plt.title('Receiver operating characteristic test')
 plt.legend(loc="lower right")
 plt.show()
 
-gmeans = np.sqrt(tpr * (1-fpr))
-optimal_threshold = thresholds[np.argmax(gmeans)]
-pred = np.where(np.array(test_pred) >= optimal_threshold, 1, 0)
-acc = np.sum(pred == test_data_new["y"].values.reshape((-1,1))) / len(test_data_new["y"])
-print('best test acc {:5.2f}'.format(acc * 100))
+pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
+acc = np.sum(pred == y_t) / len(y_t)
+print('\nBest test gmeans: {:5.2f}, Best test acc: {:5.2f}'.format(gmeans[idx], acc * 100))
+
+guess = test_data[pred.astype(np.bool)]
+no_guess = test_data[np.invert(pred.astype(np.bool))]
+total = len(test_data)
+actual_pos = sum(test_data["Positive"])
+actual_neg = sum(np.where(test_data["Positive"] == 1, 0, 1))
+pred_pos = len(guess)
+pred_neg = len(no_guess)
+correct_pos = sum(guess["Positive"])
+correct_neg = sum(np.where(no_guess["Positive"] == 1, 0, 1))
+print("total: ", total)
+print("Actual 1's: ", actual_pos, "Pred 1's: ", pred_pos)
+print("Actual 0's: ", actual_neg, "Pred 0's: ", pred_neg)
+print("Correct 1's: ", correct_pos)
+print("Correct 0's", correct_neg)
+
+report = metrics.classification_report(y_t, pred)
+print("\nClassification report:\n", report)
+
+precision, recall, thresholds = metrics.precision_recall_curve(y_t, y_t_prob, pos_label=1)
+fscore = (2 * precision * recall) / (precision + recall)
+fscore = 0.75 * precision + 0.25 * recall
+fscore = np.where(np.isnan(fscore), 0, fscore)
+idx = np.argmax(fscore) - 1
+optimal_threshold = thresholds[idx]
+
+plt.figure()
+lw = 2
+plt.plot(recall, precision, color='darkorange',
+         lw=lw)
+plt.plot([0, 1], [0, 0], color='navy', lw=lw, linestyle='--')
+plt.scatter(recall[idx], precision[idx], marker='o', color='black', label='Best')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision Recall curve')
+plt.show()
+
+pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
+acc = np.sum(pred == y_t) / len(y_t)
+print('\nBest test fscore: {:5.2f}, Best test acc: {:5.2f}'.format(fscore[idx], acc * 100))
+
+guess = test_data[pred.astype(np.bool)]
+no_guess = test_data[np.invert(pred.astype(np.bool))]
+total = len(test_data)
+actual_pos = sum(test_data["Positive"])
+actual_neg = sum(np.where(test_data["Positive"] == 1, 0, 1))
+pred_pos = len(guess)
+pred_neg = len(no_guess)
+correct_pos = sum(guess["Positive"])
+correct_neg = sum(np.where(no_guess["Positive"] == 1, 0, 1))
+print("total: ", total)
+print("Actual 1's: ", actual_pos, "Pred 1's: ", pred_pos)
+print("Actual 0's: ", actual_neg, "Pred 0's: ", pred_neg)
+print("Correct 1's: ", correct_pos)
+print("Correct 0's", correct_neg)
+
+report = metrics.classification_report(y_t, pred)
+print("\nClassification report:\n", report)
+
+
+## STEP 7: Test the final calibrated model
+# Test dataset
+test_start_date = "2020-11-01"
+test_end_date =  "2020-11-30"
+test_data = data_df.loc[test_start_date:test_end_date]
+X_t = test_data[FEATURE_COLUMNS].values
+y_t = test_data["y"].values
+test_dataset = TimeSeriesDataset(X_t, y_t)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=0)  
+
+test_loss, test_acc, y_t_prob = evaluate(best_model, test_dataloader)
+print('=' * 89)
+print('| End of calibrating | test loss {:5.4f} | test acc {:5.2f}'.format(
+    test_loss /len(test_dataset) * 100, test_acc / len(test_dataset) * 100))
+print('| Best val epoch {:3d} | val loss {:5.4f} | val acc {:5.2f}'.format(
+    best_epoch, best_val_loss /len(val_dataset) * 100, best_val_acc / len(val_dataset) * 100))
+print('| Best cal threshold {:3d} | cal loss {:5.4f} | cal acc {:5.2f}'.format(
+    best_epoch, best_val_loss /len(val_dataset) * 100, best_val_acc / len(val_dataset) * 100))
+print('=' * 89)
+
+y_t = test_data["Positive"].values
+y_t_prob = np.array(y_t_prob).reshape((-1))
+pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
+acc = np.sum(pred == y_t) / len(y_t)
+print('\nBest test fscore: {:5.2f}, Best test acc: {:5.2f}'.format(fscore[idx], acc * 100))
+
+guess = test_data[pred.astype(np.bool)]
+no_guess = test_data[np.invert(pred.astype(np.bool))]
+total = len(test_data)
+actual_pos = sum(test_data["Positive"])
+actual_neg = sum(np.where(test_data["Positive"] == 1, 0, 1))
+pred_pos = len(guess)
+pred_neg = len(no_guess)
+correct_pos = sum(guess["Positive"])
+correct_neg = sum(np.where(no_guess["Positive"] == 1, 0, 1))
+print("total: ", total)
+print("Actual 1's: ", actual_pos, "Pred 1's: ", pred_pos)
+print("Actual 0's: ", actual_neg, "Pred 0's: ", pred_neg)
+print("Correct 1's: ", correct_pos)
+print("Correct 0's", correct_neg)
+
+report = metrics.classification_report(y_t, pred)
+print("\nClassification report:\n", report)
