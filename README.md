@@ -6,6 +6,3 @@ Directory for aud/nzd high low option models. Contains data and scripts.
 
 ## gold
 Directory for gold high low option models. Contains data and scripts.
-
-## venv
-Contains the python virtual environments with all the packages need to run the current code used to develop models.
