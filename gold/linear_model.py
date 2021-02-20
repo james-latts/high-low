@@ -1,348 +1,468 @@
 #### IMPORTS & GLOBALS ####
-# Imports
-import os
-import torch
-import numpy as np
-import pandas as pd
+# System imports
+import warnings; warnings.simplefilter(action='ignore', category=Warning) # stop warning messages from pandas
 import datetime as dt
+from copy import deepcopy
+
+# External imports
+import torch; torch.manual_seed(0) # set random seed so results are reproducable
+import numpy as np; np.random.seed(0) # set random seed so results are reproducable
+import pandas as pd
 import torch.nn as nn
 from sklearn import metrics
-from itertools import product
-import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 
+# Local imports
+None
 
-#### MAIN ####
-
+# Globals
+OPTION_TYPE = "put" # choose option type to predict
+TRADE_SIZE = 250 # $ value used per trade
+WIN_RETURN_RATE = 1.88 # return if trade is correct
+FEATURE_COLUMNS = ["price", "log_price", "open", "high", "low", "close", 
+  "rsi.0", "rvi.0", "smi.0", "smi.1", "srsi.1"] # choose feature columns to use
 
 
 #### FUNCTIONS ####
-def train(epoch, train_dataloader):
-    model.train()
-    total_loss = 0.
-    total_correct = 0
-    total_pred = []
-    for batch_number, batch_data in enumerate(train_dataloader):
-        features, targets = batch_data
-        features = features.to(device)
-        targets = targets.view((-1, 1)).to(device).double()
-        optimizer.zero_grad()
-        output = model(features)
-        loss = criterion(output, targets)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-        total_loss += loss.item()
-        pred = torch.sigmoid(output).cpu().detach().numpy()
-        total_correct += np.sum(np.round(pred) == targets.cpu().detach().numpy())
-        total_pred += pred.tolist()
-    print('| epoch {:3d} | loss {:5.4f} | acc {:5.2f}'.format(
-            epoch, total_loss / len(total_pred) * 100, total_correct / len(train_dataset) * 100))
+def target(row):
+  """ Creates target column for 3 minute time series data (15 min options) """
+  if row["time"].minute % 15 == 0:
+    target = row["delta_5"]
+  elif row["time"].minute % 15 == 3:
+    target = row["delta_4"]
+  elif row["time"].minute % 15 == 6:
+    target = row["delta_3"]
+  elif row["time"].minute % 15 == 9:
+    target = row["delta_2"]
+  else:
+    target = row["delta_1"]
+  return target
 
-def evaluate(eval_model, dataloader):
-    eval_model.eval()
-    total_loss = 0.
-    total_correct = 0
-    total_pred = []
-    with torch.no_grad():
-        for batch_number, batch_data in enumerate(dataloader):
-            features, targets = batch_data
-            features = features.to(device)
-            targets = targets.view((-1, 1)).to(device).double()
-            output = eval_model(features)
-            total_loss += criterion(output, targets).item()
-            pred = torch.sigmoid(output).cpu().detach().numpy()
-            total_correct += np.sum(np.round(pred) == targets.cpu().detach().numpy())
-            total_pred += pred.tolist()
-    return total_loss, total_correct, total_pred
+def predict(model, dataloader, criterion, threshold, device):
+  """ Predicts on a given dataset for a given model and cut off threshold """
+  model.eval()
+  total_loss = 0.
+  total_correct = 0
+  total_prob = []
+  with torch.no_grad():
+    for batch_number, batch_data in enumerate(dataloader):
+      features, targets = batch_data
+      features = features.to(device)
+      targets = targets.view((-1, 1)).to(device).double()
+      output = model(features)
+      loss = criterion(output, targets)
+      total_loss += loss.item()
+      prob = torch.sigmoid(output).cpu().detach().numpy()
+      pred = np.where(prob > threshold, 1, 0)
+      targ = targets.cpu().detach().numpy()
+      total_correct += np.sum(pred == targ)
+      total_prob += prob.tolist()
+  return total_loss, total_correct, total_prob
 
 
 #### CLASSES ####
 class TimeSeriesDataset(Dataset):
-    """ Time Series Dataset """
-    def __init__(self, X, Y, transform=None):
-        """
-        Args:
-            data (string): The time series data as a pandas dataframe.
-            transform (callable, optional): Optional transform to be applied
-                on a sample.
-        """
-        self.X = X
-        self.Y = Y
-        self.transform = transform
+  """ Time Series Dataset """
+  def __init__(self, X, Y, transform=None):
+    self.X = X
+    self.Y = Y
+    self.transform = transform
 
-    def __len__(self):
-        return len(self.Y)
+  def __len__(self):
+    return len(self.Y)
 
-    def __getitem__(self, idx):
-        x = self.X[idx]
-        y = self.Y[idx]
-        if self.transform:
-            x = self.transform(x)
-        return x, y
+  def __getitem__(self, idx):
+    x = self.X[idx]
+    y = self.Y[idx]
+    if self.transform:
+      x = self.transform(x)
+    return x, y
 
 class TimeSeriesModel(nn.Module):
-    def __init__(self, classes, ninp, nhid, dropout):
-        super(TimeSeriesModel, self).__init__()
-        self.model_type = 'TimeSeries'
-        self.ninp = ninp
-        self.nhid = nhid
-        self.dropout = nn.Dropout(dropout)
-        self.linear_1 = nn.Linear(ninp, nhid)
-        self.linear_2 = nn.Linear(nhid, nhid // 2)
-        self.linear_3 = nn.Linear(nhid // 2, nhid // 4)
-        self.classify = nn.Linear(nhid // 4, classes)
-
-    def forward(self, features):
-        features = self.dropout(features)
-        features = self.linear_1(features)
-        features = self.dropout(features)
-        features = self.linear_2(features)
-        features = self.dropout(features)
-        features = self.linear_3(features)
-        features = self.dropout(features)
-        output = self.classify(features)
-        return output
+  """ Time Series Model """
+  def __init__(self, classes, ninp, nhid, dropout):
+    super(TimeSeriesModel, self).__init__()
+    self.model_type = "TimeSeries"
+    self.ninp = ninp
+    self.nhid = nhid
+    self.dropout = nn.Dropout(dropout)
+    self.linear_input = nn.Linear(ninp, nhid)
+    self.linear_hidden = nn.Linear(nhid, nhid // 2)
+    self.linear_classify = nn.Linear(nhid // 2, classes)
     
+  def forward(self, features):
+    features = self.dropout(features)
+    features = self.linear_input(features)
+    features = self.dropout(features)
+    features = self.linear_hidden(features)
+    features = self.dropout(features)
+    output = self.linear_classify(features)
+    return output
     
-#### RUN MAIN ####
-## STEP 1: Obtain and clean data
-# Load in the data in csv
-xjo_data_location = "/home/james/Documents/finance/high-low/gold/data/november_3_minute.csv"
-original_data_df = pd.read_csv(xjo_data_location)
-
-# Create cleaned dataframe
-data_df = pd.DataFrame()
-data_df["date_time"] = pd.to_datetime(original_data_df["Date"])
-data_df["price"] = original_data_df["Close"]
-data_df["log_price"] = np.log(data_df["price"])
-data_df["open"] = original_data_df["Open"]
-data_df["high"] = original_data_df["High"]
-data_df["low"] = original_data_df["Low"]
-data_df["close"] = original_data_df["Close"]
-data_df["rsi.0"] = original_data_df["RSI.0"]
-data_df["rvi.0"] = original_data_df["RVI.0"]
-data_df["smi.0"] = original_data_df["SMI.0"]
-data_df["smi.1"] = original_data_df["SMI.1"]
-data_df["srsi.1"] = original_data_df["sRSI.0"]
-data_df["srsi.1"] = original_data_df["sRSI.1"]
-data_df["time"] = data_df["date_time"].dt.time
-data_df = data_df.sort_values("date_time", ascending = True).set_index("date_time")
-
-# Clean dataframe
-data_df = data_df[data_df.index.date != dt.date(2020, 11, 16)] # remove first 110
-data_df = data_df[data_df["time"] <= dt.time(8, 0, 0) and data_df["time"] <= dt.time(10, 0, 0)] # remove non trading
-
-
-## STEP 2: Add additional features to the data and target variable
-# Need to add in target
-
-
-## STEP 3: Get train and validation datasets
-# Train dataset
-batch_size = 1000
-train_start_date = "2020-05-01"
-train_end_date =  "2020-09-30"
-train_data = data_df.loc[train_start_date:train_end_date]
-X = train_data[FEATURE_COLUMNS].values
-y = train_data["y"].values
-train_dataset = TimeSeriesDataset(X, y)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)  
-
-# Validation dataset
-val_start_date = "2020-10-01"
-val_end_date =  "2020-10-31"
-val_data = data_df.loc[val_start_date:val_end_date]
-X_v = val_data[FEATURE_COLUMNS].values
-y_v = val_data["y"].values
-val_dataset = TimeSeriesDataset(X_v, y_v)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
-
-
-## STEP 4: Create the model and train
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-classes = 1
-ninp = len(FEATURE_COLUMNS)
-nhid = 128
-dropout = 0
-model = TimeSeriesModel(classes, ninp, nhid, dropout).to(device).double()
-
-# Set weight to balance classes
-weight = (len(train_data) - sum(train_data["y"])) / sum(train_data["y"])
-
-# Set loss and optimizer
-criterion = nn.BCEWithLogitsLoss(pos_weight = torch.tensor(weight), reduction='sum')
-optimizer = torch.optim.Adam(model.parameters())
-
-# Initialise val, model and epochs
-best_val_loss = float("inf")
-best_val_acc = float(0)
-epochs = 100 # The number of epochs
-best_model = None
-
-# Train model
-for epoch in range(1, epochs + 1):
-    train(epoch, train_dataloader)
-    val_loss, val_acc, val_pred = evaluate(model, val_dataloader)
-    print('-' * 89)
-    print('| end of epoch {:3d} | val loss {:5.4f} | val_acc {:5.2f} '.format(epoch, 
-        val_loss / len(val_dataset) * 100, val_acc / len(val_dataset) * 100))
-    print('-' * 89)
-
+  
+#### MAIN ####
+def main():
+  ## STEP 1: Load data
+  # Print log message
+  print("=" * 80)
+  print("| Started loading dataset |")
+  print("-" * 80)
+  
+  # Load in the data from csv
+  data_location = "/home/james/Documents/finance/high-low/gold/data/november_3_minute.csv"
+  original_data_df = pd.read_csv(data_location)
+  
+  # Create feature dataframe
+  data_df = pd.DataFrame()
+  data_df["date_time"] = pd.to_datetime(original_data_df["Date"])
+  data_df["price"] = original_data_df[["Close"]]
+  data_df["log_price"] = np.log(data_df["price"])
+  data_df["open"] = original_data_df[["Open"]]
+  data_df["high"] = original_data_df[["High"]]
+  data_df["low"] = original_data_df[["Low"]]
+  data_df["close"] = original_data_df[["Close"]]
+  data_df["rsi.0"] = original_data_df[["RSI.0"]]
+  data_df["rvi.0"] = original_data_df[["RVI.0"]]
+  data_df["smi.0"] = original_data_df[["SMI.0"]]
+  data_df["smi.1"] = original_data_df[["SMI.1"]]
+  data_df["srsi.1"] = original_data_df[["sRSI.0"]]
+  data_df["srsi.1"] = original_data_df[["sRSI.1"]]
+  data_df = data_df.sort_values("date_time", ascending = True).set_index("date_time")
+  
+  # Add target variable
+  target_df = data_df[["log_price"]]
+  target_df["time"] = target_df.index.time
+  target_df["delta_1"] = target_df[["log_price"]].diff(-1)
+  target_df["delta_2"] = target_df[["log_price"]].diff(-2)
+  target_df["delta_3"] = target_df[["log_price"]].diff(-3)
+  target_df["delta_4"] = target_df[["log_price"]].diff(-4)
+  target_df["delta_5"] = target_df[["log_price"]].diff(-5)
+  target_df["delta"] = target_df.apply(target, axis = 1)
+  if OPTION_TYPE in ["call", "high"]:
+    target_df["target"] = np.where(target_df["delta"] > 0, 1, 0) # to predict call/high options
+  elif OPTION_TYPE in ["put", "low"]:
+    target_df["target"] = np.where(target_df["delta"] < 0, 1, 0) # to predict put/low options
+  data_df["y"] = target_df["target"]
+  
+  # Clean dataframe
+  data_df = data_df[data_df.index.date != dt.date(2020, 11, 13)] # remove first 110
+  data_df = data_df[data_df.index.date != dt.date(2020, 11, 15)] # remove first 110
+  data_df = data_df[(data_df.index.time <= dt.time(8, 0, 0)) | (data_df.index.time >= dt.time(11, 0, 0))] # remove non trading times
+  
+  # Print log message
+  print("-" * 80)
+  print("| Finished loading dataset |")
+  print("=" * 80 + "\n")
+  
+  
+  ## STEP 2: Get train, validation and test datasets
+  # Print log message
+  print("=" * 80)
+  print("| Started splitting dataset into train, validation and test sets |")
+  print("-" * 80)
+  
+  # Train dataset
+  batch_size = 100
+  train_start_date = "2020-11-16"
+  train_end_date =  "2020-11-20"
+  train_data = data_df.loc[train_start_date:train_end_date]
+  X = train_data[FEATURE_COLUMNS].values
+  y = train_data["y"].values
+  train_dataset = TimeSeriesDataset(X, y)
+  train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)  
+  
+  # Validation dataset
+  val_start_date = "2020-11-21"
+  val_end_date =  "2020-11-24"
+  val_data = data_df.loc[val_start_date:val_end_date]
+  X_v = val_data[FEATURE_COLUMNS].values
+  y_v = val_data["y"].values
+  val_dataset = TimeSeriesDataset(X_v, y_v)
+  val_dataloader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
+  
+  # Test dataset
+  test_start_date = "2020-11-24"
+  test_end_date =  "2020-11-26"
+  test_data = data_df.loc[test_start_date:test_end_date]
+  X_t = test_data[FEATURE_COLUMNS].values
+  y_t = test_data["y"].values
+  test_dataset = TimeSeriesDataset(X_t, y_t)
+  test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=0)  
+  
+  # Print log message
+  print("-" * 80)
+  print("| Finished splitting dataset into train, validation and test sets |")
+  print("=" * 80  + "\n")
+  
+  
+  ## STEP 3: Create and train the model
+  # Print log message
+  print("=" * 80)
+  print("| Started training |")
+  print("-" * 80)
+  
+  # Initial setup
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # set to use GPU if avaliable
+  classes = 1 # predict either no trade or trade
+  number_input_columns = len(FEATURE_COLUMNS) # number of data columns
+  number_hidden_layers = number_input_columns // 2 # dont want too complicated model -> overfitting
+  dropout_rate = 0.0 # randomly doesnt use layers in training to prevent overfitting
+  epochs = 100 # the number of epochs to train for
+  
+  # Create the model
+  model = TimeSeriesModel(classes, number_input_columns, number_hidden_layers, dropout_rate).to(device).double()
+  
+  # Set weight to balance classes -> stops it only predicting the majority class
+  weight = (len(train_data) - sum(train_data["y"])) / sum(train_data["y"])
+  
+  # Set loss and optimizer
+  criterion = nn.BCEWithLogitsLoss(pos_weight = torch.tensor(weight), reduction="sum")
+  optimizer = torch.optim.Adam(model.parameters())
+  
+  # Initialise the best model and validation loss
+  best_val_loss = float("inf")
+  best_model = None
+  
+  # Train model
+  for epoch in range(1, epochs + 1):
+    model.train()
+    total_loss = 0.
+    total_correct = 0
+    total_prob = []
+    for batch_number, batch_data in enumerate(train_dataloader):
+      features, targets = batch_data
+      features = features.to(device)
+      targets = targets.view((-1, 1)).to(device).double()
+      optimizer.zero_grad()
+      output = model(features)
+      loss = criterion(output, targets)
+      loss.backward()
+      torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+      optimizer.step()
+      total_loss += loss.item()
+      prob = torch.sigmoid(output).cpu().detach().numpy()
+      total_correct += np.sum(np.round(prob) == targets.cpu().detach().numpy())
+      total_prob += prob.tolist()
+      
+    # Predict on validation dataset and print log message
+    val_loss, val_acc, val_prob = predict(model, val_dataloader, criterion, 0.5, device)
+    print("| epoch {:3d} | loss {:5.4f} | acc {:5.2f}".format(epoch, 
+      total_loss / len(total_prob) * 100, total_correct / len(train_dataset) * 100))
+    print("-" * 80)
+    print("| end of epoch {:3d} | val loss {:5.4f} | val_acc {:5.2f} ".format(epoch, 
+      val_loss / len(val_dataset) * 100, val_acc / len(val_dataset) * 100))
+    print("-" * 80)
+    
+    # If the model val loss is better set the new model to this one
     if val_loss < best_val_loss:
-        best_epoch = epoch
-        best_val_loss = val_loss
-        best_val_acc = val_acc
-        best_val_pred = val_pred
-        best_model = model
-
+      best_epoch = epoch
+      best_model = deepcopy(model)
+      best_val_loss = val_loss
+      #best_val_prob = val_prob
+      
+    # Step the optimiser forward now
     optimizer.step()
+  
+  # Finish training so run best model and print results
+  train_loss, train_acc, train_prob = predict(best_model, train_dataloader, criterion, 0.5, device)
+  val_loss, val_acc, val_prob = predict(best_model, val_dataloader, criterion, 0.5, device)
+  print("| Finished training | train loss {:5.4f} | train acc {:5.2f}".format(
+      train_loss /len(train_dataset) * 100, train_acc / len(train_dataset) * 100))
+  print("| Best val epoch {:3d} | val loss {:5.4f} | val acc {:5.2f}".format(
+      best_epoch, val_loss /len(val_dataset) * 100, val_acc / len(val_dataset) * 100))
+  print("=" * 80 + "\n")
+  
+  
+  ## STEP 4: Calibrate the model
+  # Print log message
+  print("=" * 80)
+  print("| Started calibrating the model |")
+  print("-" * 80)
+  
+  # Get the validation known y and predicted prob y
+  y_v = val_data["y"].values
+  y_v_prob = np.array(val_prob).reshape((-1))
+  
+  # Get fpr, tpr and thresholds (ROC curve and AUC is general measure of model strength)
+  fpr, tpr, thresholds = metrics.roc_curve(y_v, y_v_prob, pos_label=1)
+  auc = metrics.auc(fpr, tpr)
+  print("ROC/AUC score: {}".format(round(auc, 2)))  
+  
+  # Normally you would just pick threshold that maximised the geometric mean
+  # between fpr and tpr but we want to maximise profit function
+  profit = []
+  for thresh in thresholds:
+    y_v_pred = np.where(y_v_prob >= thresh, True, False)
+    pred_pos = sum(y_v_pred)
+    correct_pos = sum(y_v[y_v_pred])
+    profit += [correct_pos*WIN_RETURN_RATE - pred_pos]
+  
+  # Pick index that maximises profit then assign that as optimal threshold
+  index = np.argmax(np.array(profit))
+  optimal_threshold = thresholds[index]
+  
+  # Print log message
+  print("-" * 80)
+  print("| Finished calibrating the model |")
+  print("=" * 80 + "\n")
+  
+  
+  ## STEP 5: Test the final calibrated model
+  # Print log message
+  print("=" * 80)
+  print("| Started testing the model |")
+  print("-" * 80)
+  
+  # First test the model on the training dataset (doesnt matter too much)
+  # Run the best model and get the actual and predicted results
+  train_loss, train_acc, train_prob = predict(best_model, train_dataloader, criterion, optimal_threshold, device)
+  y_t = train_data["y"].values
+  y_t_prob = np.array(train_prob).reshape((-1))
+  pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
+  
+  # Calculate the raw results
+  prediction = train_data[pred.astype(np.bool)]
+  no_prediction = train_data[np.invert(pred.astype(np.bool))]
+  total = len(train_data)
+  actual_pos = sum(train_data["y"])
+  actual_neg = sum(np.where(train_data["y"] == 1, 0, 1))
+  pred_pos = len(prediction)
+  pred_neg = len(no_prediction)
+  correct_pos = sum(prediction["y"])
+  correct_neg = sum(np.where(no_prediction["y"] == 1, 0, 1))
+  acc_pos = round(correct_pos / pred_pos * 100, 2)
+  acc_neg = round(correct_neg / pred_neg * 100, 2)
+  
+  # Print the raw results report
+  print("")
+  print("-" * 80)
+  print("| Train Dateset | (Don't really care about these results)")
+  print("-" * 80)
+  print("Raw results report:")
+  print("-" * 80)
+  print("| Actual 1's:", actual_pos, "| Pred 1's:", pred_pos, "| Correct 1's:", correct_pos, "| Accuracy 1's:", acc_pos)
+  print("| Actual 0's:", actual_neg, "| Pred 0's:", pred_neg, "| Correct 0's", correct_neg, "| Accuracy 0's:", acc_neg)
+  print("| Total Data Points:", total, "|")
+  print("-" * 80)
+  
+  # Print the classification report
+  report = metrics.classification_report(y_t, pred)
+  print("Classification report:")
+  print("-" * 80)
+  print(report)
+  print("-" * 80)
+  
+  # Second test the model on the validation dataset (doesnt matter too much)
+  # Run the best model and get the actual and predicted results
+  val_loss, val_acc, val_prob = predict(best_model, val_dataloader, criterion, optimal_threshold, device)
+  y_v = val_data["y"].values
+  y_v_prob = np.array(val_prob).reshape((-1))
+  pred = np.where(np.array(y_v_prob) >= optimal_threshold, 1, 0)
+  
+  # Calculate the raw results
+  prediction = val_data[pred.astype(np.bool)]
+  no_prediction = val_data[np.invert(pred.astype(np.bool))]
+  total = len(val_data)
+  actual_pos = sum(val_data["y"])
+  actual_neg = sum(np.where(val_data["y"] == 1, 0, 1))
+  pred_pos = len(prediction)
+  pred_neg = len(no_prediction)
+  correct_pos = sum(prediction["y"])
+  correct_neg = sum(np.where(no_prediction["y"] == 1, 0, 1))
+  acc_pos = round(correct_pos / pred_pos * 100, 2)
+  acc_neg = round(correct_neg / pred_neg * 100, 2)
+  
+  # Print the raw results report
+  print("")
+  print("-" * 80)
+  print("| Validation Dateset | (Don't care too much about these results)")
+  print("-" * 80)
+  print("Raw results report:")
+  print("-" * 80)
+  print("| Actual 1's:", actual_pos, "| Pred 1's:", pred_pos, "| Correct 1's:", correct_pos, "| Accuracy 1's:", acc_pos)
+  print("| Actual 0's:", actual_neg, "| Pred 0's:", pred_neg, "| Correct 0's", correct_neg, "| Accuracy 0's:", acc_neg)
+  print("| Total Data Points:", total, "|")
+  print("-" * 80)
+  
+  # Print the classification report
+  report = metrics.classification_report(y_v, pred)
+  print("Classification report:")
+  print("-" * 80)
+  print(report)
+  print("-" * 80)
+  
+  # Finally test the model on the test dataset (this is the main dataset results we care about)
+  # Run the best model and get the actual and predicted results
+  test_loss, test_acc, test_prob = predict(best_model, test_dataloader, criterion, optimal_threshold, device)
+  y_t = test_data["y"].values
+  y_t_prob = np.array(test_prob).reshape((-1))
+  pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
+  
+  # Calculate the raw results
+  predictions = test_data[pred.astype(np.bool)]
+  no_predictions = test_data[np.invert(pred.astype(np.bool))]
+  total = len(test_data)
+  actual_pos = sum(test_data["y"])
+  actual_neg = sum(np.where(test_data["y"] == 1, 0, 1))
+  pred_pos = len(predictions)
+  pred_neg = len(no_predictions)
+  correct_pos = sum(predictions["y"])
+  correct_neg = sum(np.where(no_predictions["y"] == 1, 0, 1))
+  acc_pos = round(correct_pos / pred_pos * 100, 2)
+  acc_neg = round(correct_neg / pred_neg * 100, 2)
+  
+  # Print the raw results report
+  print("")
+  print("-" * 80)
+  print("| Test Dateset | (Care the most about these results)")
+  print("-" * 80)
+  print("Raw results report:")
+  print("-" * 80)
+  print("| Actual 1's:", actual_pos, "| Pred 1's:", pred_pos, "| Correct 1's:", correct_pos, "| Accuracy 1's:", acc_pos)
+  print("| Actual 0's:", actual_neg, "| Pred 0's:", pred_neg, "| Correct 0's", correct_neg, "| Accuracy 0's:", acc_neg)
+  print("| Total Data Points:", total, "|")
+  print("-" * 80)
+  
+  # Print the classification report
+  report = metrics.classification_report(y_t, pred)
+  print("Classification report:")
+  print("-" * 80)
+  print("\n" + report)
+  print("-" * 80)
+  print("")
+  
+  # Print test profit result
+  print("-" * 80)
+  print("Testing Profit/Loss Report: {}$ trades from {} to {}".format(TRADE_SIZE, test_start_date, test_end_date))
+  print("-" * 80)
+  trade_period = str((dt.datetime.strptime(test_end_date, "%Y-%m-%d") - dt.datetime.strptime(test_start_date, "%Y-%m-%d")).days)
+  number_of_trades = pred_pos
+  cost_of_trades = round(number_of_trades * TRADE_SIZE)
+  number_of_wins = correct_pos
+  return_of_wins = round(correct_pos * TRADE_SIZE * WIN_RETURN_RATE)
+  expected_return = (correct_pos*WIN_RETURN_RATE - pred_pos) / pred_pos
+  expected_profit = round(expected_return * cost_of_trades)
+  print("{} total trades with total cost of {}$".format(number_of_trades, cost_of_trades))
+  print("{} winning trades with total return of {}$".format(number_of_wins, return_of_wins))
+  print("")
+  print("Profit for {} days trading with {}$ trades:".format(trade_period, TRADE_SIZE))
+  print("\tprofit = return - cost")
+  print("\tprofit = {}$ - {}$".format(return_of_wins, cost_of_trades))
+  print("\tprofit = {}$".format(expected_profit))
+  print("")
+  print("Expected return per trade = {}%".format(round(expected_return * 100, 2)))
+  print("-" * 80)
+  print("")
+  
+  # Print log message
+  print("-" * 80)
+  print("| Finished testing the model |")
+  print("=" * 80)
+  
+  # Return the best model
+  return best_model
+    
 
-## STEP 5: Calibrate the model
-# Calibration dataset
-cal_start_date = "2020-11-01"
-cal_end_date =  "2020-11-30"
-cal_data = data_df.loc[cal_start_date:cal_end_date]
-X_t = cal_data[FEATURE_COLUMNS].values
-y_t = cal_data["y"].values
-cal_data = TimeSeriesDataset(X_t, y_t)
-cal_dataloader = DataLoader(cal_data, batch_size=batch_size, num_workers=0)
-
-cal_loss, cal_acc, y_c_prob = evaluate(best_model, cal_dataloader)
-print('=' * 89)
-print('| End of training | cal loss {:5.4f} | cal acc {:5.2f}'.format(
-    cal_loss /len(cal_dataset) * 100, cal_acc / len(cal_dataset) * 100))
-print('| Best val epoch {:3d} | val loss {:5.4f} | val acc {:5.2f}'.format(
-    best_epoch, best_val_loss /len(val_dataset) * 100, best_val_acc / len(val_dataset) * 100))
-print('=' * 89)
-
-y_t = test_data["Positive"].values
-y_t_prob = np.array(y_t_prob).reshape((-1))
-fpr, tpr, thresholds = metrics.roc_curve(y_t, y_t_prob, pos_label=1)
-auc = metrics.auc(fpr, tpr)
-gmeans = np.sqrt(tpr * (1-fpr))
-idx = np.argmax(gmeans) - 1
-optimal_threshold = thresholds[idx]
-
-plt.figure()
-lw = 2
-plt.plot(fpr, tpr, color='darkorange',
-         lw=lw, label='ROC curve (area = %0.4f)' % auc)
-plt.scatter(fpr[idx], tpr[idx], marker='o', color='black', label='Best')
-plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver operating characteristic test')
-plt.legend(loc="lower right")
-plt.show()
-
-pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
-acc = np.sum(pred == y_t) / len(y_t)
-print('\nBest test gmeans: {:5.2f}, Best test acc: {:5.2f}'.format(gmeans[idx], acc * 100))
-
-guess = test_data[pred.astype(np.bool)]
-no_guess = test_data[np.invert(pred.astype(np.bool))]
-total = len(test_data)
-actual_pos = sum(test_data["Positive"])
-actual_neg = sum(np.where(test_data["Positive"] == 1, 0, 1))
-pred_pos = len(guess)
-pred_neg = len(no_guess)
-correct_pos = sum(guess["Positive"])
-correct_neg = sum(np.where(no_guess["Positive"] == 1, 0, 1))
-print("total: ", total)
-print("Actual 1's: ", actual_pos, "Pred 1's: ", pred_pos)
-print("Actual 0's: ", actual_neg, "Pred 0's: ", pred_neg)
-print("Correct 1's: ", correct_pos)
-print("Correct 0's", correct_neg)
-
-report = metrics.classification_report(y_t, pred)
-print("\nClassification report:\n", report)
-
-precision, recall, thresholds = metrics.precision_recall_curve(y_t, y_t_prob, pos_label=1)
-fscore = (2 * precision * recall) / (precision + recall)
-fscore = 0.75 * precision + 0.25 * recall
-fscore = np.where(np.isnan(fscore), 0, fscore)
-idx = np.argmax(fscore) - 1
-optimal_threshold = thresholds[idx]
-
-plt.figure()
-lw = 2
-plt.plot(recall, precision, color='darkorange',
-         lw=lw)
-plt.plot([0, 1], [0, 0], color='navy', lw=lw, linestyle='--')
-plt.scatter(recall[idx], precision[idx], marker='o', color='black', label='Best')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.title('Precision Recall curve')
-plt.show()
-
-pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
-acc = np.sum(pred == y_t) / len(y_t)
-print('\nBest test fscore: {:5.2f}, Best test acc: {:5.2f}'.format(fscore[idx], acc * 100))
-
-guess = test_data[pred.astype(np.bool)]
-no_guess = test_data[np.invert(pred.astype(np.bool))]
-total = len(test_data)
-actual_pos = sum(test_data["Positive"])
-actual_neg = sum(np.where(test_data["Positive"] == 1, 0, 1))
-pred_pos = len(guess)
-pred_neg = len(no_guess)
-correct_pos = sum(guess["Positive"])
-correct_neg = sum(np.where(no_guess["Positive"] == 1, 0, 1))
-print("total: ", total)
-print("Actual 1's: ", actual_pos, "Pred 1's: ", pred_pos)
-print("Actual 0's: ", actual_neg, "Pred 0's: ", pred_neg)
-print("Correct 1's: ", correct_pos)
-print("Correct 0's", correct_neg)
-
-report = metrics.classification_report(y_t, pred)
-print("\nClassification report:\n", report)
-
-
-## STEP 7: Test the final calibrated model
-# Test dataset
-test_start_date = "2020-11-01"
-test_end_date =  "2020-11-30"
-test_data = data_df.loc[test_start_date:test_end_date]
-X_t = test_data[FEATURE_COLUMNS].values
-y_t = test_data["y"].values
-test_dataset = TimeSeriesDataset(X_t, y_t)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=0)  
-
-test_loss, test_acc, y_t_prob = evaluate(best_model, test_dataloader)
-print('=' * 89)
-print('| End of calibrating | test loss {:5.4f} | test acc {:5.2f}'.format(
-    test_loss /len(test_dataset) * 100, test_acc / len(test_dataset) * 100))
-print('| Best val epoch {:3d} | val loss {:5.4f} | val acc {:5.2f}'.format(
-    best_epoch, best_val_loss /len(val_dataset) * 100, best_val_acc / len(val_dataset) * 100))
-print('| Best cal threshold {:3d} | cal loss {:5.4f} | cal acc {:5.2f}'.format(
-    best_epoch, best_val_loss /len(val_dataset) * 100, best_val_acc / len(val_dataset) * 100))
-print('=' * 89)
-
-y_t = test_data["Positive"].values
-y_t_prob = np.array(y_t_prob).reshape((-1))
-pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
-acc = np.sum(pred == y_t) / len(y_t)
-print('\nBest test fscore: {:5.2f}, Best test acc: {:5.2f}'.format(fscore[idx], acc * 100))
-
-guess = test_data[pred.astype(np.bool)]
-no_guess = test_data[np.invert(pred.astype(np.bool))]
-total = len(test_data)
-actual_pos = sum(test_data["Positive"])
-actual_neg = sum(np.where(test_data["Positive"] == 1, 0, 1))
-pred_pos = len(guess)
-pred_neg = len(no_guess)
-correct_pos = sum(guess["Positive"])
-correct_neg = sum(np.where(no_guess["Positive"] == 1, 0, 1))
-print("total: ", total)
-print("Actual 1's: ", actual_pos, "Pred 1's: ", pred_pos)
-print("Actual 0's: ", actual_neg, "Pred 0's: ", pred_neg)
-print("Correct 1's: ", correct_pos)
-print("Correct 0's", correct_neg)
-
-report = metrics.classification_report(y_t, pred)
-print("\nClassification report:\n", report)
+#### RUN MAIN ####
+if __name__ == "__main__":
+  best_model = main()

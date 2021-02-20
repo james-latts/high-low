@@ -11,6 +11,7 @@ import numpy as np; np.random.seed(0) # set random seed so results are reproduca
 import pandas as pd
 import torch.nn as nn
 from sklearn import metrics
+from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset, DataLoader
 
 # Local imports
@@ -21,8 +22,8 @@ OPTION_TYPE = "call" # choose option type to predict
 TRADE_SIZE = 250 # $ value used per trade
 WIN_RETURN_RATE = 1.88 # return if trade is correct
 FEATURE_COLUMNS = ["price", "log_price", "open", "high", "low", "volume"] # choose feature columns to use
-EXTRA_FEATURES = ["sma", "ema_14", "rsi", "so"]
-FEATURE_COLUMNS += EXTRA_FEATURES + ["min", "max", "std", "ema_12", "ema_26", "low_rsi", "high_rsi", "obv"]
+EXTRA_FEATURES = ["sma", "ema_14", "rsi", "so"] + ["min", "max", "std", "ema_12", "ema_26", "low_rsi", "high_rsi", "obv"]
+FEATURE_COLUMNS += EXTRA_FEATURES
 
 
 #### MAIN ####
@@ -33,10 +34,11 @@ def main():
 #### FUNCTIONS ####
 def target(row):
   """ Creates target column for 1 minute time series data (15 min options) """
-  for i in range(1, 16):
-    if row["time"].minute % 15 == abs(i - 15):
-      name = "delta_{}".format(i)
-      target = row[name]
+  if row["time"].minute % 5 == 0:
+    name = "delta_{}".format(15)
+    target = row[name]
+  else:
+    target = 0
   return target
 
 def compute_rsi(data, time_window):
@@ -71,7 +73,7 @@ def compute_obv(data, time_window):
   obv = chg.rolling(time_window).sum()
   return obv
 
-def predict(model, dataloader, threshold):
+def predict(model, dataloader, criterion, threshold, device):
   """ Predicts on a given dataset for a given model and cut off threshold """
   model.eval()
   total_loss = 0.
@@ -151,7 +153,7 @@ for xjo_csv_file in os.listdir(xjo_data_location):
 
 # Create cleaned dataframe
 data_df = pd.DataFrame()
-data_df["date_time"] = pd.to_datetime(original_data_df["Time"])
+data_df["date_time"] = pd.to_datetime(original_data_df["Time"]) + dt.timedelta(hours=16)
 data_df["price"] = original_data_df[["Last"]]
 data_df["log_price"] = np.log(data_df["price"])
 data_df["open"] = original_data_df[["Open"]]
@@ -175,27 +177,48 @@ data_df["srsi"] = compute_srsi((data_df["low_rsi"], data_df["rsi"], data_df["hig
 data_df["so"] = compute_so(data_df["price"], 14)
 data_df["obv"] = compute_obv((data_df["price"], data_df["volume"]), 14)
 
+# Set the dates for train, validation and test start
+#train_start_date = str(data_df.index[0].date())
+#val_start_date = "2020-09-01"
+#test_start_date = "2020-11-01"
+#train_days = dt.datetime.strptime(val_start_date, "%Y-%m-%d") - dt.datetime.strptime(train_start_date, "%Y-%m-%d") - dt.timedelta(days=1)
+#val_days = dt.datetime.strptime(test_start_date, "%Y-%m-%d") - dt.datetime.strptime(val_start_date, "%Y-%m-%d") - dt.timedelta(days=1)
+#test_days = data_df.index[-1] - dt.datetime.strptime(test_start_date, "%Y-%m-%d") - dt.timedelta(days=1)
+#train_end_date = str((dt.datetime.strptime(train_start_date, "%Y-%m-%d") + train_days).date())
+#val_end_date = str((dt.datetime.strptime(val_start_date, "%Y-%m-%d") + val_days).date())
+#test_end_date = str((dt.datetime.strptime(test_start_date, "%Y-%m-%d") + dt.timedelta(days=test_days.days)).date())
+train_start_date = "2020-11-16"
+train_end_date =  "2020-11-20"
+val_start_date = "2020-11-21"
+val_end_date =  "2020-11-24"
+test_start_date = "2020-11-25"
+test_end_date =  "2020-11-26"
+
 # Add target variable
-target_df = data_df[["log_price"]]
+target_df = data_df[["price"]]
 target_df["time"] = target_df.index.time
 for i in range(1, 16):
   name = "delta_{}".format(i)
-  target_df[name] = target_df[["log_price"]].diff(-i)
+  target_df[name] = target_df[["price"]].diff(-i)
 target_df["delta"] = target_df.apply(target, axis = 1)
 if OPTION_TYPE in ["call", "high"]:
-  target_df["target"] = np.where(((target_df["delta"] - np.mean(target_df["delta"])) / np.std(target_df["delta"])) > 0.5, 1, 0) # to predict call/high options
-  data_df["y_all"] = np.where(target_df["delta"] > 0, 1, 0) # to predict call/high options
+  data_df["y"] = np.where(target_df["delta"] > 0, 1, 0) # to predict call/high options
 elif OPTION_TYPE in ["put", "low"]:
-  target_df["target"] = np.where(((target_df["delta"] - np.mean(target_df["delta"])) / np.std(target_df["delta"])) < -0.5, 1, 0) # to predict call/high options
-  data_df["y_all"] = np.where(target_df["delta"] < 0, 1, 0) # to predict put/low options
-data_df["y"] = target_df["target"]
+  data_df["y"] = np.where(target_df["delta"] < 0, 1, 0) # to predict put/low options
+
+# Scale features
+train_data = data_df.loc[train_start_date:train_end_date]
+scaler = MinMaxScaler()
+scaler.fit(train_data[FEATURE_COLUMNS])
+data_df[FEATURE_COLUMNS] = scaler.transform(data_df[FEATURE_COLUMNS])
 
 # Clean dataframe
-data_df = data_df[(data_df.index.weekday != 6)] # remove non trading times
-data_df = data_df[(data_df.index.time >= dt.time(8, 0, 0)) | (data_df.index.weekday == 0)] # remove non trading times
-data_df = data_df[(data_df.index.time >= dt.time(9, 0, 0)) | (data_df.index.weekday == 1)] # remove non trading times
-data_df = data_df[(data_df.index.time <= dt.time(8, 0, 0)) | (data_df.index.time >= dt.time(11, 0, 0))] # remove non trading times
-data_df = data_df[data_df.index.date != dt.date(2020, 9, 1)] # remove first day
+data_df = data_df[(data_df.index.weekday != 6)] # remove non trading times (Sunday)
+data_df = data_df[np.invert(np.all([data_df.index.weekday == 0, data_df.index.time <= dt.time(9, 0, 0)], axis = 0))] # remove non trading times (Monday 9am)
+data_df = data_df[np.invert(np.all([data_df.index.weekday == 5, data_df.index.time >= dt.time(8, 0, 0)], axis = 0))] # remove non trading times (Saturday 8am)
+data_df = data_df[np.invert(np.all([data_df.index.time >= dt.time(8, 0, 0), data_df.index.time <= dt.time(11, 0, 0)], axis = 0))] # remove non trading times (Weekdays 8am - 9am)
+data_df = data_df[data_df.index.date != data_df.head(1).index.values[0].astype("datetime64[m]").astype(dt.datetime).date()] # remove first day
+data_df = data_df[data_df.index.minute % 5 == 0] # remove any non trading intervals
 
 # Print log message
 print("-" * 80)
@@ -211,8 +234,6 @@ print("-" * 80)
 
 # Train dataset
 batch_size = 1000
-train_start_date = "2020-09-01"
-train_end_date = str((dt.datetime.strptime(train_start_date, "%Y-%m-%d") + dt.timedelta(days=60)).date())
 train_data = data_df.loc[train_start_date:train_end_date]
 X = train_data[FEATURE_COLUMNS].values
 y = train_data["y"].values
@@ -220,8 +241,6 @@ train_dataset = TimeSeriesDataset(X, y)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)  
 
 # Validation dataset
-val_start_date = "2020-11-01"
-val_end_date = str((dt.datetime.strptime(val_start_date, "%Y-%m-%d") + dt.timedelta(days=14)).date())
 val_data = data_df.loc[val_start_date:val_end_date]
 X_v = val_data[FEATURE_COLUMNS].values
 y_v = val_data["y"].values
@@ -229,8 +248,6 @@ val_dataset = TimeSeriesDataset(X_v, y_v)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
 
 # Test datasetput
-test_start_date = "2020-11-16"
-test_end_date = str((dt.datetime.strptime(test_start_date, "%Y-%m-%d") + dt.timedelta(days=14)).date())
 test_data = data_df.loc[test_start_date:test_end_date]
 X_t = test_data[FEATURE_COLUMNS].values
 y_t = test_data["y"].values
@@ -293,7 +310,7 @@ for epoch in range(1, epochs + 1):
     total_prob += prob.tolist()
     
   # Predict on validation dataset and print log message
-  val_loss, val_acc, val_prob = predict(model, val_dataloader, 0.5)
+  val_loss, val_acc, val_prob = predict(model, val_dataloader, criterion, 0.5, device)
   print("| epoch {:3d} | loss {:5.4f} | acc {:5.2f}".format(epoch, 
     total_loss / len(total_prob) * 100, total_correct / len(train_dataset) * 100))
   print("-" * 80)
@@ -312,8 +329,8 @@ for epoch in range(1, epochs + 1):
   optimizer.step()
 
 # Finish training so run best model and print results
-train_loss, train_acc, train_prob = predict(best_model, train_dataloader, 0.5)
-val_loss, val_acc, val_prob = predict(best_model, val_dataloader, 0.5)
+train_loss, train_acc, train_prob = predict(best_model, train_dataloader, criterion, 0.5, device)
+val_loss, val_acc, val_prob = predict(best_model, val_dataloader, criterion, 0.5, device)
 print("| Finished training | train loss {:5.4f} | train acc {:5.2f}".format(
     train_loss /len(train_dataset) * 100, train_acc / len(train_dataset) * 100))
 print("| Best val epoch {:3d} | val loss {:5.4f} | val acc {:5.2f}".format(
@@ -369,7 +386,7 @@ print("-" * 80)
 
 # First test the model on the training dataset (doesnt matter too much)
 # Run the best model and get the actual and predicted results
-train_loss, train_acc, train_prob = predict(best_model, train_dataloader, optimal_threshold)
+train_loss, train_acc, train_prob = predict(best_model, train_dataloader, criterion, optimal_threshold, device)
 y_t = train_data["y"].values
 y_t_prob = np.array(train_prob).reshape((-1))
 pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
@@ -409,7 +426,7 @@ print("-" * 80)
 
 # Second test the model on the validation dataset (doesnt matter too much)
 # Run the best model and get the actual and predicted results
-val_loss, val_acc, val_prob = predict(best_model, val_dataloader, optimal_threshold)
+val_loss, val_acc, val_prob = predict(best_model, val_dataloader, criterion, optimal_threshold, device)
 y_v = val_data["y"].values
 y_v_prob = np.array(val_prob).reshape((-1))
 pred = np.where(np.array(y_v_prob) >= optimal_threshold, 1, 0)
@@ -449,7 +466,7 @@ print("-" * 80)
 
 # Finally test the model on the test dataset (this is the main dataset results we care about)
 # Run the best model and get the actual and predicted results
-test_loss, test_acc, test_prob = predict(best_model, test_dataloader, optimal_threshold)
+test_loss, test_acc, test_prob = predict(best_model, test_dataloader, criterion, optimal_threshold, device)
 y_t = test_data["y"].values
 y_t_prob = np.array(test_prob).reshape((-1))
 pred = np.where(np.array(y_t_prob) >= optimal_threshold, 1, 0)
